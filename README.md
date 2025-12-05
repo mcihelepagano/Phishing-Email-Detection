@@ -66,10 +66,11 @@ More informations available on the kaggle page of the dataset: [DATASET ON KAGGL
 
 ## Deep Learning model
 
-- Ensure dependencies are installed: `pip install -r ./src/requirements.txt` (adds torch, transformers, tqdm).
-- Launch the CLI with `python ./src` and select "Train a DL model" from the menu.
-- Choose "Fine-tune DistilBERT" to train on the `text_combined` field (Subject + Body); defaults use 2 epochs, batch size 8, lr=5e-5, and max length 256.
-- Training automatically handles class imbalance and runs on GPU if available (falls back to CPU).
-- Saved artifacts (model, tokenizer, label map) are stored in `models/distilbert_phishing/` for later reuse.
-- To re-evaluate, pick "Evaluate saved DistilBERT model" to print accuracy, precision, recall, F1, ROC-AUC, and per-class support.
-- GPU is optional but will speed up fine-tuning when present.
+- Ensure dependencies are installed: `pip install -r ./src/requirements.txt` (adds torch + tqdm; transformers removed to stay lightweight).
+- Launch the CLI with `python ./src` and select "Train a DL model". Choose between:
+    - `Train lightweight TextCNN (cross-entropy)`
+    - `Train lightweight TextCNN (focal loss + optional GA threshold)`
+- Defaults aim to stay CPU-friendly: epochs=4, batch size=32, lr=1e-3, max tokens=200, vocab=20k, sample limit=80k emails. The model is a small 1D CNN over token embeddings; imbalance is handled with class weights and sampling.
+- Saved artifacts live in `models/text_cnn_phishing/` (model.pt, vocab.json, label mapping, config, and optional GA-tuned threshold).
+- To evaluate, pick `Evaluate saved lightweight DL model`; metrics include accuracy, precision, recall, F1, ROC-AUC, and class support. If a GA threshold was tuned, it is reused for binary problems.
+- GPU is optional but will shorten training time if available.

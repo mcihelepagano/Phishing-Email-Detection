@@ -191,7 +191,7 @@ class DataManager:
         # Check for columns with high missing data
         high_missing = [col for col, stats in completeness.items() if stats["completeness_rate"] < 50]
         if high_missing:
-            issues.append(f"High missing data (>50%): {", ".join(high_missing)}")
+            issues.append(f"High missing data (>50%): {', '.join(high_missing)}")
 
         # Check for duplicate rows
         if self.df.duplicated().sum() > 0:
@@ -200,7 +200,7 @@ class DataManager:
         # Check for constant columns
         constant_cols = [col for col in self.df.columns if self.df[col].nunique() <= 1]
         if constant_cols:
-            issues.append(f"Constant columns (no variance): {", ".join(constant_cols)}")
+            issues.append(f"Constant columns (no variance): {', '.join(constant_cols)}")
 
         return {
             "completeness": completeness,

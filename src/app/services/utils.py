@@ -137,26 +137,39 @@ async def train_dl_model_menu():
         return
 
     print("Deep Learning options:")
-    print("1. Fine-tune DistilBERT")
-    print("2. Evaluate saved DistilBERT model")
+    print("1. Train lightweight TextCNN (cross-entropy)")
+    print("2. Train lightweight TextCNN (focal loss + optional GA threshold)")
+    print("3. Evaluate saved lightweight DL model")
 
-    choice = ask_for_integer("Enter choice", default=1, min=1, max=2)
-    if choice == 1:
-        epochs = ask_for_integer("Epochs", default=2, min=1)
-        batch_size = ask_for_integer("Batch size", default=8, min=1)
-        lr = ask_for_float("Learning rate", default=5e-5, min=1e-6, max=1e-2)
-        max_length = ask_for_integer("Max sequence length", default=256, min=64, max=512)
+    choice = ask_for_integer("Enter choice", default=1, min=1, max=3)
+    if choice in (1, 2):
+        epochs = ask_for_integer("Epochs", default=4, min=1)
+        batch_size = ask_for_integer("Batch size", default=32, min=4)
+        lr = ask_for_float("Learning rate", default=1e-3, min=1e-5, max=5e-2)
+        max_length = ask_for_integer("Max tokens per email", default=200, min=50, max=400)
+        max_vocab = ask_for_integer("Max vocabulary size", default=20000, min=2000, max=50000)
+        sample_limit = ask_for_integer("Max samples to use (0 = use all)", default=80000, min=0)
+        scoring = "cross_entropy" if choice == 1 else "focal"
+        use_ga = False
+        focal_gamma = 2.0
+        if choice == 2:
+            focal_gamma = ask_for_float("Focal gamma", default=2.0, min=0.5, max=5.0)
+            use_ga = ask_yes_no("Run GA to tune decision threshold after training? (binary only)", default=True)
         print(f"Using device: {dl_trainer.device}")
-        dl_trainer.fine_tune_distilbert(
+        dl_trainer.train_text_cnn(
             epochs=epochs,
             learning_rate=lr,
             batch_size=batch_size,
-            max_length=max_length
+            max_length=max_length,
+            max_vocab_size=max_vocab,
+            train_sample_limit=sample_limit,
+            scoring=scoring,
+            focal_gamma=focal_gamma,
+            use_genetic_threshold=use_ga
         )
-    elif choice == 2:
-        batch_size = ask_for_integer("Batch size", default=8, min=1)
-        max_length = ask_for_integer("Max sequence length", default=256, min=64, max=512)
-        dl_trainer.evaluate_saved_model(batch_size=batch_size, max_length=max_length)
+    elif choice == 3:
+        batch_size = ask_for_integer("Batch size", default=32, min=4)
+        dl_trainer.evaluate_saved_model(batch_size=batch_size)
     else:
         print("Invalid choice.")
 

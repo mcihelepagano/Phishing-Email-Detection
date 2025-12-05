@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+.vscode
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.ruff_cache
+.mypy_cache
+.pytest_cache
+*.log
+env/
+venv/
+.DS_Store
+Thumbs.db

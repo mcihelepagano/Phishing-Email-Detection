@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    image: phishing-email-detection:latest
+    working_dir: /app
+    command: ["python", "-m", "src"]
+    stdin_open: true
+    tty: true
+    volumes:
+      - phishing-email-detection-app:/app
+
+volumes:
+  phishing-email-detection-app:
