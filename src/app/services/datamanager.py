@@ -1,7 +1,9 @@
 from typing import Literal
 
 import kagglehub
+import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 
 from app.services.preprocessing import Preprocessor
 
@@ -9,6 +11,7 @@ from app.services.preprocessing import Preprocessor
 class DataManager:
     def __init__(self):
         self.df: pd.DataFrame | None = None
+        self.split_indices: dict | None = None
 
     async def load_data(self) -> pd.DataFrame:
         try:
@@ -219,6 +222,49 @@ class DataManager:
             "email_specific_stats": await self.get_email_specific_stats(),
             "data_quality": await self.get_data_quality_report()
         }
+
+    def ensure_split(self, test_size: float = 0.2, val_size: float = 0.1, random_state: int = 42):
+        """
+        Create and cache a deterministic train/val/test split (indices) to reuse across models.
+        """
+        if self.df is None:
+            raise ValueError("Please load the dataset first.")
+
+        if self.split_indices is not None:
+            return self.split_indices
+
+        if test_size <= 0 or test_size >= 0.5:
+            raise ValueError("test_size should be in (0, 0.5) to leave room for train/val.")
+        if val_size < 0 or val_size >= 0.5:
+            raise ValueError("val_size should be in [0, 0.5).")
+
+        labels = self.df["Label"] if "Label" in self.df.columns else None
+        indices = np.arange(len(self.df))
+
+        train_val_idx, test_idx = train_test_split(
+            indices,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=labels if labels is not None and labels.nunique() > 1 else None
+        )
+
+        if val_size > 0:
+            relative_val = val_size / (1 - test_size)
+            train_idx, val_idx = train_test_split(
+                train_val_idx,
+                test_size=relative_val,
+                random_state=random_state,
+                stratify=labels.iloc[train_val_idx] if labels is not None and labels.nunique() > 1 else None
+            )
+        else:
+            train_idx, val_idx = train_val_idx, np.array([], dtype=int)
+
+        self.split_indices = {
+            "train": np.array(train_idx, dtype=int),
+            "val": np.array(val_idx, dtype=int),
+            "test": np.array(test_idx, dtype=int)
+        }
+        return self.split_indices
 
     async def handle_quality_issues(self, drop_constants: bool = True, threshold: float = 50.0):
         """Runs preprocessing steps from preprocessing.py"""

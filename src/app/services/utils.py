@@ -3,6 +3,7 @@ import subprocess
 import sys
 
 from halo import Halo
+from scipy import sparse
 
 from app.services.datamanager import datamanager
 from app.services.dl_trainer import DLTrainer
@@ -115,6 +116,7 @@ async def train_model_menu():
     print("1. Random Forest")
     print("2. Stochastic Gradient Descent (SGD)")
     print("3. Linear SVM")
+    print("4. Decision Tree")
 
     choice = int(input("Enter choice: "))
     if choice == 1:
@@ -123,6 +125,8 @@ async def train_model_menu():
         modelmanager.train_model("sgd")
     elif choice == 3:
         modelmanager.train_model("linear_svm")
+    elif choice == 4:
+        modelmanager.train_model("decision_tree")
     else:
         print("Invalid choice.")
         return
@@ -139,9 +143,11 @@ async def train_dl_model_menu():
     print("Deep Learning options:")
     print("1. Train lightweight TextCNN (cross-entropy)")
     print("2. Train lightweight TextCNN (focal loss + optional GA threshold)")
-    print("3. Evaluate saved lightweight DL model")
+    print("3. Train DistilBERT")
+    print("4. Evaluate saved DistilBERT model")
+    print("5. Evaluate saved lightweight DL model")
 
-    choice = ask_for_integer("Enter choice", default=1, min=1, max=3)
+    choice = ask_for_integer("Enter choice", default=1, min=1, max=5)
     if choice in (1, 2):
         epochs = ask_for_integer("Epochs", default=4, min=1)
         batch_size = ask_for_integer("Batch size", default=32, min=4)
@@ -168,6 +174,23 @@ async def train_dl_model_menu():
             use_genetic_threshold=use_ga
         )
     elif choice == 3:
+        epochs = ask_for_integer("Epochs", default=2, min=1)
+        batch_size = ask_for_integer("Batch size", default=8, min=2)
+        lr = ask_for_float("Learning rate", default=5e-5, min=1e-6, max=1e-3)
+        max_length = ask_for_integer("Max sequence length", default=256, min=64, max=512)
+        sample_limit = ask_for_integer("Max train samples (0 = use all)", default=0, min=0)
+        print(f"Using device: {dl_trainer.device}")
+        dl_trainer.fine_tune_distilbert(
+            epochs=epochs,
+            learning_rate=lr,
+            batch_size=batch_size,
+            max_length=max_length,
+            train_sample_limit=sample_limit
+        )
+    elif choice == 4:
+        batch_size = ask_for_integer("Batch size", default=8, min=2)
+        dl_trainer.evaluate_saved_distilbert(batch_size=batch_size)
+    elif choice == 5:
         batch_size = ask_for_integer("Batch size", default=32, min=4)
         dl_trainer.evaluate_saved_model(batch_size=batch_size)
     else:
@@ -187,6 +210,24 @@ async def continue_training_model():
     if save == "y":
         modelmanager.save_model()
 
+async def export_test_split():
+    """Export cached test split features/labels for external analysis (e.g., Colab)."""
+    if datamanager.df is None or getattr(datamanager, "X_processed", None) is None:
+        print("Please load, preprocess, and vectorize the dataset first.")
+        return
+    try:
+        mm = ModelManager(datamanager)
+        X, y = mm.get_features_and_labels()
+        splits = datamanager.ensure_split()
+        test_idx = splits["test"]
+        X_test = X[test_idx]
+        y_test = y.iloc[test_idx]
+        sparse.save_npz("X_test.npz", X_test)
+        y_test.to_csv("y_test.csv", index=False)
+        print("Saved test split to X_test.npz and y_test.csv in the current directory.")
+    except Exception as e:
+        print(f"Export failed: {e}")
+
 
 async def menu():
     options = {
@@ -196,7 +237,8 @@ async def menu():
         4: ("Train a classical ML model", train_model_menu),
         5: ("Load a saved model", load_saved_model),
         6: ("Continue training a loaded model", continue_training_model),
-        7: ("Train a DL model", train_dl_model_menu)
+        7: ("Train a DL model", train_dl_model_menu),
+        8: ("Export test split (X_test, y_test)", export_test_split)
     }
 
     while True:

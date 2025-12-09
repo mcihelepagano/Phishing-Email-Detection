@@ -4,7 +4,7 @@ from typing import Optional
 import joblib
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import SGDClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, average_precision_score, classification_report
 from sklearn.model_selection import KFold, cross_validate, train_test_split
 from sklearn.svm import LinearSVC
 from sklearn.tree import DecisionTreeClassifier
@@ -57,9 +57,10 @@ class ModelManager:
     def train_model(self, model_type="RandomForest"):
         """Train a classical ML model (RandomForest, SGDClassifier, LinearSVM, or DecisionTree)."""
         X, y = self.get_features_and_labels()
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
+        splits = self.dm.ensure_split()
+        train_idx, test_idx = splits["train"], splits["test"]
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
         model_type = model_type.lower().replace(" ", "_")
 
@@ -94,7 +95,21 @@ class ModelManager:
         y_pred = self.model.predict(X_test)
 
         acc = accuracy_score(y_test, y_pred)
+        # Compute PR-AUC if the estimator can score probabilities or decision function
+        pr_auc = None
+        try:
+            if hasattr(self.model, "predict_proba"):
+                scores = self.model.predict_proba(X_test)[:, 1]
+                pr_auc = average_precision_score(y_test, scores)
+            elif hasattr(self.model, "decision_function"):
+                scores = self.model.decision_function(X_test)
+                pr_auc = average_precision_score(y_test, scores)
+        except Exception:
+            pr_auc = None
+
         print(f"\nAccuracy: {acc:.4f}\n")
+        if pr_auc is not None:
+            print(f"PR-AUC (Average Precision): {pr_auc:.4f}\n")
         print(classification_report(y_test, y_pred))
 
     # -----------------------------
@@ -132,7 +147,7 @@ class ModelManager:
         kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
 
         if use_multiple_metrics:
-            scoring = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc']
+            scoring = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc', 'average_precision']
             results = cross_validate(model, X, y, cv=kf, scoring=scoring, n_jobs=-1)
 
             print(f"\nCross-validation results for {model_type}:")
@@ -141,6 +156,7 @@ class ModelManager:
             print(f"Recall:    {results['test_recall'].mean():.4f} (+/- {results['test_recall'].std():.4f})")
             print(f"F1 Score:  {results['test_f1'].mean():.4f} (+/- {results['test_f1'].std():.4f})")
             print(f"ROC-AUC:   {results['test_roc_auc'].mean():.4f} (+/- {results['test_roc_auc'].std():.4f})")
+            print(f"PR-AUC:    {results['test_average_precision'].mean():.4f} (+/- {results['test_average_precision'].std():.4f})")
 
             return results
         else:
@@ -187,10 +203,12 @@ class ModelManager:
 
         X, y = self.get_features_and_labels()
 
+        splits = self.dm.ensure_split(test_size=test_size)
+        train_idx, test_idx = splits["train"], splits["test"]
+
         if evaluate:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=test_size, random_state=42, stratify=y if len(set(y)) > 1 else None
-            )
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
             print(f"\nContinuing training of {self.model_name} with holdout evaluation ({test_size:.0%})...")
             self.model.fit(X_train, y_train)
             y_pred = self.model.predict(X_test)

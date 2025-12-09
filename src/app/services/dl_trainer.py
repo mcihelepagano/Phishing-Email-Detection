@@ -11,13 +11,16 @@ from sklearn.metrics import (
     accuracy_score,
     classification_report,
     f1_score,
+    average_precision_score,
     precision_recall_fscore_support,
     roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
 from torch import nn
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm.auto import tqdm
+from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
 
 class SequenceDataset(Dataset):
@@ -94,6 +97,8 @@ class DLTrainer:
         self.dm = datamanager
         self.save_dir = save_dir or os.path.join("models", "text_cnn_phishing")
         os.makedirs(self.save_dir, exist_ok=True)
+        self.hf_save_dir = os.path.join("models", "distilbert_phishing")
+        os.makedirs(self.hf_save_dir, exist_ok=True)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # -----------------------------
@@ -153,16 +158,22 @@ class DLTrainer:
         self,
         sequences: torch.Tensor,
         labels: list[int],
-        batch_size: int,
-        val_size: float = 0.2
+        batch_size: int
     ):
-        stratify = labels if len(set(labels)) > 1 else None
-        indices = np.arange(len(labels))
-        train_idx, val_idx = train_test_split(indices, test_size=val_size, random_state=42, stratify=stratify)
+        splits = self.dm.ensure_split()
+        train_idx = splits.get("train", np.array([], dtype=int))
+        val_idx = splits.get("val", np.array([], dtype=int))
+
+        # Fallback: if validation split is empty, reuse test as validation
+        if val_idx.size == 0:
+            val_idx = splits.get("test", np.array([], dtype=int))
+
+        train_tensor_idx = torch.as_tensor(train_idx, dtype=torch.long)
+        val_tensor_idx = torch.as_tensor(val_idx, dtype=torch.long)
 
         y_train = [labels[i] for i in train_idx]
-        train_sequences = sequences[train_idx]
-        val_sequences = sequences[val_idx]
+        train_sequences = sequences[train_tensor_idx]
+        val_sequences = sequences[val_tensor_idx]
         y_val = [labels[i] for i in val_idx]
 
         class_counts = np.bincount(y_train)
@@ -183,6 +194,81 @@ class DLTrainer:
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
+            num_workers=0
+        )
+        return train_loader, val_loader, class_weights, y_val
+
+    def _build_hf_dataloaders(
+        self,
+        texts: list[str],
+        labels: list[int],
+        tokenizer,
+        batch_size: int,
+        max_length: int,
+        sample_limit: int | None = None
+    ):
+        splits = self.dm.ensure_split()
+        train_idx = splits.get("train", np.array([], dtype=int))
+        val_idx = splits.get("val", np.array([], dtype=int))
+        if val_idx.size == 0:
+            val_idx = splits.get("test", np.array([], dtype=int))
+
+        if sample_limit and sample_limit > 0 and len(train_idx) > sample_limit:
+            labels_train = [labels[i] for i in train_idx]
+            stratify = labels_train if len(set(labels_train)) > 1 else None
+            sampled_idx, _ = train_test_split(
+                train_idx,
+                train_size=sample_limit,
+                random_state=42,
+                stratify=stratify
+            )
+            train_idx = np.array(sampled_idx, dtype=int)
+
+        train_texts = [texts[i] for i in train_idx]
+        val_texts = [texts[i] for i in val_idx]
+        y_train = [labels[i] for i in train_idx]
+        y_val = [labels[i] for i in val_idx]
+
+        class_counts = np.bincount(y_train)
+        class_weights = 1.0 / np.maximum(class_counts, 1)
+        sample_weights = [class_weights[label] for label in y_train]
+        sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+        def collate_fn(batch):
+            batch_texts, batch_labels = zip(*batch)
+            enc = tokenizer(
+                list(batch_texts),
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt"
+            )
+            enc["labels"] = torch.tensor(batch_labels, dtype=torch.long)
+            return enc
+
+        class TextDataset(Dataset):
+            def __init__(self, data_texts, data_labels):
+                self.data_texts = data_texts
+                self.data_labels = data_labels
+
+            def __len__(self):
+                return len(self.data_labels)
+
+            def __getitem__(self, idx):
+                return self.data_texts[idx], self.data_labels[idx]
+
+        train_loader = DataLoader(
+            TextDataset(train_texts, y_train),
+            batch_size=batch_size,
+            sampler=sampler,
+            collate_fn=collate_fn,
+            num_workers=0
+        )
+        val_loader = DataLoader(
+            TextDataset(val_texts, y_val),
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
             num_workers=0
         )
         return train_loader, val_loader, class_weights, y_val
@@ -302,6 +388,93 @@ class DLTrainer:
         )
         return metrics
 
+    def fine_tune_distilbert(
+        self,
+        epochs: int = 2,
+        learning_rate: float = 5e-5,
+        batch_size: int = 8,
+        max_length: int = 256,
+        model_checkpoint: str = "distilbert-base-uncased",
+        train_sample_limit: int = 0
+    ):
+        df = self._ensure_text_column()
+
+        labels_raw = df["Label"]
+        if labels_raw.isnull().any():
+            df = df.dropna(subset=["Label"])
+            labels_raw = df["Label"]
+
+        texts = df["text_combined"].fillna("").astype(str).tolist()
+        encoded_labels, label2id, id2label = self._encode_labels(labels_raw.tolist())
+
+        tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
+        config = AutoConfig.from_pretrained(
+            model_checkpoint,
+            num_labels=len(label2id),
+            id2label=id2label,
+            label2id=label2id
+        )
+        model = AutoModelForSequenceClassification.from_pretrained(model_checkpoint, config=config)
+        model.to(self.device)
+
+        train_loader, val_loader, class_weights, val_labels = self._build_hf_dataloaders(
+            texts, encoded_labels, tokenizer, batch_size, max_length, train_sample_limit
+        )
+
+        class_weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
+        optimizer = AdamW(model.parameters(), lr=learning_rate)
+        total_steps = len(train_loader) * epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=max(1, int(0.1 * total_steps)),
+            num_training_steps=total_steps
+        )
+        loss_fn = torch.nn.CrossEntropyLoss(weight=class_weight_tensor)
+
+        for epoch in range(epochs):
+            model.train()
+            epoch_loss = 0.0
+            progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False)
+            for batch in progress:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                optimizer.zero_grad()
+                outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                logits = outputs.logits
+                loss = loss_fn(logits, batch["labels"])
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                epoch_loss += loss.item()
+                progress.set_postfix({"loss": f"{loss.item():.4f}"})
+            print(f"Epoch {epoch + 1} - average training loss: {epoch_loss / max(len(train_loader), 1):.4f}")
+
+        metrics = self.evaluate_hf(model, val_loader, id2label, return_probs=False)
+        self._print_metrics(metrics)
+        self._save_hf_model(model, tokenizer, label2id, max_length)
+        return metrics
+
+    def evaluate_hf(self, model, dataloader, id2label, return_probs: bool = False):
+        model.eval()
+        all_labels, all_preds, prob_batches = [], [], []
+
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                logits = outputs.logits
+                probs = torch.softmax(logits, dim=1)
+                preds = torch.argmax(probs, dim=1)
+
+                all_labels.extend(batch["labels"].cpu().tolist())
+                all_preds.extend(preds.cpu().tolist())
+                prob_batches.append(probs.cpu().numpy())
+
+        prob_matrix = np.concatenate(prob_batches, axis=0) if prob_batches else np.empty((0, len(id2label)))
+        metrics = self._compute_metrics(all_labels, all_preds, prob_matrix, id2label)
+        if return_probs:
+            return metrics, prob_matrix
+        return metrics
+
     def evaluate(self, model, dataloader, id2label, return_probs: bool = False):
         model.eval()
         all_labels, all_preds, prob_batches = [], [], []
@@ -333,13 +506,17 @@ class DLTrainer:
         )
 
         roc_auc = None
+        pr_auc = None
         try:
             if len(id2label) == 2 and prob_matrix.shape[1] >= 2:
                 roc_auc = roc_auc_score(labels, prob_matrix[:, 1])
+                pr_auc = average_precision_score(labels, prob_matrix[:, 1])
             elif prob_matrix.size > 0:
                 roc_auc = roc_auc_score(labels, prob_matrix, multi_class="ovr")
+                pr_auc = average_precision_score(labels, prob_matrix, average="macro")
         except Exception:
             roc_auc = None
+            pr_auc = None
 
         target_names = [id2label[idx] for idx in sorted(id2label)]
         report_text = classification_report(
@@ -360,6 +537,7 @@ class DLTrainer:
             "recall": recall,
             "f1": f1,
             "roc_auc": roc_auc,
+            "pr_auc": pr_auc,
             "support": support_per_class,
             "report": report_text
         }
@@ -376,6 +554,11 @@ class DLTrainer:
             print(f"ROC-AUC:   {roc:.4f}")
         else:
             print("ROC-AUC:   not available for this run")
+        pr = metrics.get("pr_auc")
+        if pr is not None:
+            print(f"PR-AUC:    {pr:.4f}")
+        else:
+            print("PR-AUC:    not available for this run")
         if "threshold" in metrics:
             print(f"Decision threshold (GA tuned): {metrics['threshold']:.3f}")
         print("Per-class support:")
@@ -431,6 +614,15 @@ class DLTrainer:
                 json.dump({"threshold": threshold}, fp, indent=2)
         print(f"Model artifacts saved to {self.save_dir}")
 
+    def _save_hf_model(self, model, tokenizer, label2id, max_length: int):
+        model.save_pretrained(self.hf_save_dir)
+        tokenizer.save_pretrained(self.hf_save_dir)
+        with open(os.path.join(self.hf_save_dir, "label_mapping.json"), "w", encoding="utf-8") as fp:
+            json.dump(label2id, fp, indent=2)
+        with open(os.path.join(self.hf_save_dir, "config.json"), "w", encoding="utf-8") as fp:
+            json.dump({"max_length": max_length}, fp, indent=2)
+        print(f"Saved DistilBERT model to {self.hf_save_dir}")
+
     def _load_vocab(self):
         vocab_path = os.path.join(self.save_dir, "vocab.json")
         if not os.path.exists(vocab_path):
@@ -470,6 +662,29 @@ class DLTrainer:
         print(f"Loaded DL model from {self.save_dir} (device: {self.device})")
         return model, vocab, id2label, config, threshold
 
+    def _load_hf_model(self):
+        if not os.path.exists(self.hf_save_dir):
+            print(f"No saved DistilBERT model found in {self.hf_save_dir}")
+            return None, None, None, None
+        try:
+            with open(os.path.join(self.hf_save_dir, "label_mapping.json"), "r", encoding="utf-8") as fp:
+                label2id = json.load(fp)
+        except FileNotFoundError:
+            label2id = {}
+        try:
+            with open(os.path.join(self.hf_save_dir, "config.json"), "r", encoding="utf-8") as fp:
+                extra_config = json.load(fp)
+        except FileNotFoundError:
+            extra_config = {}
+
+        tokenizer = AutoTokenizer.from_pretrained(self.hf_save_dir)
+        config = AutoConfig.from_pretrained(self.hf_save_dir)
+        model = AutoModelForSequenceClassification.from_pretrained(self.hf_save_dir, config=config)
+        model.to(self.device)
+        id2label = {int(v): k for k, v in label2id.items()} if label2id else config.id2label
+        max_length = extra_config.get("max_length", 256)
+        return model, tokenizer, id2label, max_length
+
     def evaluate_saved_model(self, batch_size: int = 32):
         model, vocab, id2label, config, threshold = self.load_model()
         if model is None:
@@ -493,5 +708,27 @@ class DLTrainer:
         metrics, prob_matrix = self.evaluate(model, val_loader, id2label, return_probs=True)
         if threshold is not None and prob_matrix is not None and len(id2label) == 2:
             metrics = self._apply_threshold(metrics, prob_matrix, val_labels, id2label, threshold)
+        self._print_metrics(metrics)
+        return metrics
+
+    def evaluate_saved_distilbert(self, batch_size: int = 8):
+        model, tokenizer, id2label, max_length = self._load_hf_model()
+        if model is None or tokenizer is None or id2label is None:
+            return
+
+        df = self._ensure_text_column()
+        labels_raw = df["Label"]
+        if labels_raw.isnull().any():
+            df = df.dropna(subset=["Label"])
+            labels_raw = df["Label"]
+
+        texts = df["text_combined"].fillna("").astype(str).tolist()
+        label2id = {label: idx for idx, label in id2label.items()} if isinstance(id2label, dict) else {}
+        encoded_labels = [label2id.get(str(label), 0) for label in labels_raw.tolist()]
+
+        _, val_loader, _, _ = self._build_hf_dataloaders(
+            texts, encoded_labels, tokenizer, batch_size, max_length
+        )
+        metrics = self.evaluate_hf(model, val_loader, id2label, return_probs=False)
         self._print_metrics(metrics)
         return metrics
